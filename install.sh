@@ -169,6 +169,9 @@ install_prereqs() {
   info "Installing prerequisites (curl, ca-certificates, git, jq, openssl, python3) ..."
   if have apt-get; then
     export DEBIAN_FRONTEND=noninteractive
+    # Self-heal broken/incomplete dpkg state (common on fresh VPS images).
+    dpkg --configure -a 2>/dev/null || true
+    apt-get --fix-broken install -y -qq >/dev/null 2>&1 || true
     apt-get update -qq
     apt-get install -y -qq curl ca-certificates git jq openssl python3 >/dev/null
   elif have dnf; then
