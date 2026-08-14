@@ -1,0 +1,110 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 222 47% 4%;
+    --foreground: 210 40% 96%;
+    --card: 222 45% 6%;
+    --card-foreground: 210 40% 96%;
+    --popover: 222 45% 7%;
+    --popover-foreground: 210 40% 96%;
+    --primary: 228 100% 62%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 217 33% 14%;
+    --secondary-foreground: 210 40% 92%;
+    --muted: 217 33% 12%;
+    --muted-foreground: 215 20% 62%;
+    --accent: 217 33% 16%;
+    --accent-foreground: 210 40% 96%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 152 76% 40%;
+    --success-foreground: 0 0% 100%;
+    --warning: 38 92% 55%;
+    --warning-foreground: 222 47% 6%;
+    --border: 217 30% 14%;
+    --input: 217 30% 16%;
+    --ring: 228 100% 62%;
+    --radius: 0.75rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans;
+    background-image:
+      radial-gradient(1100px 600px at 85% -10%, rgba(59, 87, 255, 0.12), transparent 60%),
+      radial-gradient(900px 500px at -10% 20%, rgba(34, 211, 238, 0.07), transparent 55%),
+      radial-gradient(700px 500px at 50% 110%, rgba(59, 87, 255, 0.06), transparent 60%);
+    background-attachment: fixed;
+    min-height: 100vh;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 8px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.4);
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-card/60 backdrop-blur-xl border border-white/5 shadow-glass;
+  }
+
+  .glass-soft {
+    @apply bg-card/40 backdrop-blur-md border border-white/5;
+  }
+
+  .surface {
+    @apply bg-card border border-border;
+  }
+
+  .thin-border {
+    @apply border border-white/5;
+  }
+
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-cavrix-400 to-cyan-300;
+  }
+
+  .status-dot {
+    @apply inline-block h-2 w-2 rounded-full;
+  }
+}
+
+/* Recharts dark tweaks */
+.recharts-cartesian-grid line {
+  stroke: hsl(var(--border) / 0.6);
+}
+.recharts-tooltip-cursor {
+  fill: hsl(var(--muted) / 0.25);
+}
+.recharts-default-tooltip {
+  border-radius: 8px !important;
+}
