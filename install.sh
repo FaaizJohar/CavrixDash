@@ -173,7 +173,9 @@ install_prereqs() {
     dpkg --configure -a 2>/dev/null || true
     apt-get --fix-broken install -y -qq >/dev/null 2>&1 || true
     apt-get update -qq
-    apt-get install -y -qq curl ca-certificates git jq openssl python3 >/dev/null
+    # --no-upgrade: only install missing packages. Never upgrade existing ones
+    # (btrfs/overlay root filesystems fail dpkg's backup-hardlink with EXDEV).
+    apt-get install -y -qq --no-upgrade curl ca-certificates git jq openssl python3 >/dev/null
   elif have dnf; then
     dnf install -y -q curl ca-certificates git jq openssl python3
   elif have yum; then
