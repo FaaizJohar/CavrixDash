@@ -40,7 +40,7 @@ ASSUME_YES=0
 NON_INTERACTIVE=0
 NO_FIREWALL=0
 REGENERATE_SECRETS=0
-CMD="${1:-install}"
+CMD="install"
 
 # ----------------------------------------------------------------- utils ----
 have() { command -v "$1" >/dev/null 2>&1; }
