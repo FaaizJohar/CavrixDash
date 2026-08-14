@@ -8,9 +8,12 @@ from sqlalchemy.orm import Session
 
 from app.core.crypto import encrypt_secret, mask_secret
 from app.core.errors import AppError, NotFoundError
+from app.core.logging import get_logger
 from app.models.offer import Offer
 from app.models.provider import Provider, ProviderCredential
 from app.providers.registry import get_adapter
+
+log = get_logger("provider")
 
 
 def get_provider(db: Session, provider_id: str) -> Provider:
@@ -195,3 +198,94 @@ def sync_offers(db: Session, provider: Provider) -> int:
 def track_provider_revenue(db: Session, provider: Provider, amount: float) -> None:
     provider.revenue_tracked = round((provider.revenue_tracked or 0) + amount, 4)
     db.flush()
+
+
+def _parse_dt(value: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def is_sync_due(db: Session, provider: Provider) -> bool:
+    """Whether a background offer-sync should run for this provider.
+
+    Healthy providers sync at most once per `provider_sync_interval_minutes`.
+    After consecutive failures the delay grows exponentially:
+    base * 2^(failures - 1), capped at `provider_sync_max_backoff_minutes`.
+    """
+    from app.core.config import settings as app_settings
+
+    last = provider.last_attempt_at or provider.last_synced_at or ""
+    if not last:
+        return True
+    last_dt = _parse_dt(last)
+    if last_dt is None:
+        return True
+    elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+    failures = provider.sync_error_count or 0
+    if failures:
+        delay = app_settings.provider_sync_error_base_seconds * (2 ** min(failures - 1, 8))
+        delay = min(delay, app_settings.provider_sync_max_backoff_minutes * 60)
+    else:
+        delay = app_settings.provider_sync_interval_minutes * 60
+    return elapsed >= delay
+
+
+def sync_enabled_providers(db: Session) -> dict[str, Any]:
+    """Worker entry point: sync offers for every due, enabled provider.
+
+    Applies exponential backoff on failures and resets the failure counter (and
+    updates `last_synced_at`) on success. Never raises; per-provider errors are
+    recorded on the row and returned in the summary.
+    """
+    providers = (
+        db.query(Provider)
+        .filter(Provider.enabled == True)  # noqa: E712
+        .order_by(Provider.priority.asc())
+        .all()
+    )
+    summary: dict[str, Any] = {
+        "providers": len(providers),
+        "synced": [],
+        "pending_backoff": 0,
+        "failed": [],
+        "offers": 0,
+    }
+    if not providers:
+        return summary
+
+    now = datetime.now(timezone.utc).isoformat()
+    for p in providers:
+        if not is_sync_due(db, p):
+            summary["pending_backoff"] += 1
+            continue
+        p.last_attempt_at = now
+        try:
+            count = sync_offers(db, p)
+        except AppError as exc:
+            p.status = "error"
+            p.last_error = str(exc.message)[:2000]
+            p.sync_error_count = (p.sync_error_count or 0) + 1
+            db.commit()
+            summary["failed"].append({"code": p.code, "message": str(exc.message)})
+            log.warning("provider_sync_failed", provider=p.code, attempt=p.sync_error_count)
+            continue
+        except Exception as exc:  # pragma: no cover
+            p.status = "error"
+            p.last_error = repr(exc)[:2000]
+            p.sync_error_count = (p.sync_error_count or 0) + 1
+            db.commit()
+            summary["failed"].append({"code": p.code, "message": repr(exc)})
+            log.warning("provider_sync_failed", provider=p.code, attempt=p.sync_error_count)
+            continue
+        p.sync_error_count = 0
+        db.commit()
+        summary["synced"].append(p.code)
+        summary["offers"] += int(count)
+        log.info("provider_synced", provider=p.code, offers=int(count))
+
+    return summary

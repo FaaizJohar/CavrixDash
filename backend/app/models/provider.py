@@ -21,6 +21,8 @@ class Provider(Base, TimestampMixin, UUIDPrimaryKeyMixin):
     revenue_tracked: Mapped[float] = mapped_column(Float, default=0.0)
     meta: Mapped[str] = mapped_column(Text, default="{}")  # JSON provider-specific metadata
     last_synced_at: Mapped[str] = mapped_column(String(40), default="")
+    last_attempt_at: Mapped[str] = mapped_column(String(40), default="")
+    sync_error_count: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str] = mapped_column(Text, default="")
 
 

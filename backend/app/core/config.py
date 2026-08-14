@@ -87,6 +87,13 @@ class Settings(BaseSettings):
     # Mock provider is a development-only fixture. MUST be explicitly enabled
     # via env in non-production environments; never enabled by default.
     mock_provider_enabled: bool = False
+    # Background offer-sync cadence (minutes). Each enabled provider is synced
+    # at most once per interval.
+    provider_sync_interval_minutes: int = 30
+    # Exponential backoff parameters used when a provider sync fails.
+    # Delay for the N-th consecutive failure = base * 2^(N-1), capped at max.
+    provider_sync_error_base_seconds: int = 60
+    provider_sync_max_backoff_minutes: int = 240
 
     # Bootstrap
     seed_admin_email: str = "admin@cavrix.cloud"

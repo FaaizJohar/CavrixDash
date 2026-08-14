@@ -10,7 +10,7 @@ log = get_logger("worker")
 
 
 def _tick() -> None:
-    from app.services import worker_service
+    from app.services import provider_service, worker_service
 
     db = SessionLocal()
     try:
@@ -18,6 +18,7 @@ def _tick() -> None:
         worker_service.sync_nodes(db)
         worker_service.expire_tasks(db)
         worker_service.send_announcements(db)
+        provider_service.sync_enabled_providers(db)
     except Exception as exc:  # pragma: no cover
         log.error("tick_failed", exc=repr(exc))
     finally:
