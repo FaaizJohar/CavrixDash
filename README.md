@@ -79,6 +79,53 @@ Seeded via `SEED_ADMIN_EMAIL` / `SEED_ADMIN_PASSWORD` in `.env` (defaults `admin
 
 ## Production
 
+### One-command VPS installer (Docker + custom domain via Cloudflare)
+
+`install.sh` provisions the whole platform on any Ubuntu/Debian VPS: it installs
+Docker, builds the stack, sets up Postgres + Redis, provisions a Let's Encrypt
+certificate for your domain (DNS-01 via Cloudflare when a token is given), and
+prints your admin credentials.
+
+```bash
+# 1. Point your domain at the VPS in Cloudflare (DNS-only or proxied is fine).
+
+# 2. Run the installer on the VPS as root:
+bash <(curl -fsSL https://raw.githubusercontent.com/FaaizJohar/CavrixDash/main/install.sh) \
+    --domain cavrix.example.com \
+    --email you@example.com \
+    --cf-token <YOUR_CLOUDFLARE_DNS_TOKEN>
+```
+
+What it does:
+
+- Installs Docker + Compose v2, opens UFW ports 22/80/443.
+- Creates/updates the Cloudflare `A` records for `@` and `www`.
+- Generates `SECRET_KEY`, a Fernet `ENCRYPTION_KEY`, DB password and admin
+  password; writes `.env` + `.Caddyfile` (mode 600).
+- Runs `docker compose -f docker-compose.prod.yml up -d --build` (Caddy → nginx
+  → FastAPI; Postgres/Redis are not exposed publicly).
+- Waits for `/healthz` and prints your login URL + admin password.
+
+Manage the deployment:
+
+```bash
+./install.sh status           # container status + backend health
+./install.sh logs             # tail all logs   (./install.sh logs backend)
+./install.sh restart          # restart everything
+./install.sh backup           # pg_dump into ./backups/
+./install.sh uninstall        # remove stack + volumes (keeps .env)
+```
+
+Flags: `--domain`, `--email`, `--cf-token`, `--cf-zone-id`, `--admin-email`,
+`--admin-password`, `--repo-dir`, `--regenerate-secrets`, `-y/--yes`,
+`-n/--non-interactive`, `--no-firewall`. Full reference: `./install.sh --help`.
+
+Without a Cloudflare token the installer still works — it just leaves you to
+add the `A` record manually (DNS-only) and Caddy uses the standard HTTP-01
+challenge.
+
+### Manual deployment
+
 See `docs/DEPLOYMENT.md`. Notes:
 
 - Always run behind TLS. Set `SECURE_COOKIES=true`.

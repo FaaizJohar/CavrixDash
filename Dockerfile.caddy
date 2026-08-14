@@ -1,0 +1,10 @@
+# Caddy built with the Cloudflare DNS provider so TLS certificates can be
+# issued via DNS-01 challenge (works even when the domain is proxied behind
+# Cloudflare's orange cloud). When no Cloudflare token is configured the
+# install.sh simply omits the `tls dns cloudflare` block and Caddy falls back
+# to the default HTTP-01 challenge.
+FROM caddy:2-builder AS builder
+RUN xcaddy build --with github.com/caddy-dns/cloudflare
+
+FROM caddy:2
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy

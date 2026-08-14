@@ -1,0 +1,131 @@
+name: cavrix
+
+# Production stack. Services db/redis are NOT exposed to the internet.
+# All public traffic enters through caddy (TLS termination) -> frontend
+# (nginx, serves the built app and proxies /api + /ws) -> backend.
+
+x-backend-env: &backend-env
+  APP_ENV: production
+  DB_AUTO_CREATE: "false"
+  MOCK_PROVIDER_ENABLED: "false"
+  SECURE_COOKIES: "true"
+  CORS_ORIGINS: "https://${CAVRIX_DOMAIN:?CAVRIX_DOMAIN is required (set in .env)}"
+  FRONTEND_URL: "https://${CAVRIX_DOMAIN}"
+  PUBLIC_BASE_URL: "https://${CAVRIX_DOMAIN}"
+  DATABASE_URL: "postgresql+psycopg://cavrix:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (set in .env)}@db:5432/cavrix"
+  REDIS_URL: "redis://redis:6379/0"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cavrix
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (set in .env)}
+      POSTGRES_DB: cavrix
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cavrix -d cavrix"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: "no"
+    env_file: .env
+    environment: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+    command: alembic upgrade head
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      # Localhost-only: used by install.sh for health checks. Never expose publicly.
+      - "127.0.0.1:8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - backend_logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 10
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment: *backend-env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command: python -m app.workers.worker
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  caddy:
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN:-}
+      CLOUDFLARE_DNS_API_TOKEN: ${CLOUDFLARE_DNS_API_TOKEN:-}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    volumes:
+      - ./.Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+
+volumes:
+  pgdata:
+  backend_logs:
+  caddy_data:
+  caddy_config:
