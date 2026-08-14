@@ -2,17 +2,20 @@
 # ============================================================================
 #  Cavrix Cloud - all-in-one installer / manager
 #
-#  Installs the Cavrix Cloud dashboard on a fresh Linux VPS (Ubuntu/Debian)
-#  with Docker, wires a custom domain through Cloudflare, provisions a
-#  Let's Encrypt certificate (DNS-01 via Cloudflare API when a token is
-#  supplied), and prints your admin credentials.
+#  One-click deploy on ANY Ubuntu/Debian VPS (or Docker container):
+#    - Auto-detects the environment and installs with Docker Compose when a
+#      Docker daemon is reachable, otherwise runs natively (SQLite + Python
+#      venv + static frontend + Caddy TLS). No Postgres/Redis required in
+#      native mode (the app degrades gracefully without Redis).
+#    - Wires a custom domain through Cloudflare (auto DNS records + DNS-01 TLS).
+#    - Prints your admin credentials when done.
 #
 #  One-liner (run as root):
 #      bash <(curl -fsSL https://raw.githubusercontent.com/FaaizJohar/CavrixDash/main/install.sh) \
 #          --domain cavrix.example.com --email you@mail.com --cf-token <CF_API_TOKEN>
 #
 #  Subcommands: install | start | stop | restart | logs | status | backup | uninstall
-#
+#  Modes:       --mode auto (default) | docker | native
 # ============================================================================
 
 set -euo pipefail
@@ -29,6 +32,10 @@ REPO_DIR="${SCRIPT_DIR}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/cavrix}"
 GIT_REPO="https://github.com/FaaizJohar/CavrixDash.git"
 COMPOSE_FILE="docker-compose.prod.yml"
+NATIVE_MARKER=".native"
+NODE_VERSION="20.18.0"
+RUN_DIR=""
+LOG_DIR=""
 
 CAVRIX_DOMAIN=""
 ACME_EMAIL=""
@@ -36,6 +43,7 @@ CF_TOKEN=""
 CF_ZONE_ID=""
 ADMIN_EMAIL="admin@cavrix.cloud"
 ADMIN_PASSWORD=""
+MODE="auto"                      # auto | docker | native
 ASSUME_YES=0
 NON_INTERACTIVE=0
 NO_FIREWALL=0
@@ -72,6 +80,27 @@ gen_password() { openssl rand -base64 16 | tr -d '=' | tr '/+' '_-'; }
 
 dc() { docker compose --project-directory "${REPO_DIR}" -f "${REPO_DIR}/${COMPOSE_FILE}" "$@"; }
 
+arch_map() { # arch_map -> x64/amd64|arm64|arm64
+  case "$(uname -m)" in
+    x86_64) printf '%s' "${1:-x64}" ;;
+    aarch64|arm64) printf '%s' "${2:-arm64}" ;;
+    *) printf '%s' "unsupported" ;;
+  esac
+}
+
+in_container() {
+  [[ -f /.dockerenv || -f /run/.containerenv ]] && return 0
+  grep -qE "/(docker|lxc)/" /proc/1/cgroup 2>/dev/null && return 0
+  return 1
+}
+
+docker_ok() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker info >/dev/null 2>&1
+}
+
+is_systemd() { [[ "$(ps -p 1 -o comm= 2>/dev/null)" == "systemd" ]]; }
+
 # -------------------------------------------------------------- CLI args ----
 POS_ARGS=()
 parse_args() {
@@ -85,6 +114,7 @@ parse_args() {
       -z|--cf-zone-id)    CF_ZONE_ID="${2:-}"; shift ;;
       -a|--admin-email)   ADMIN_EMAIL="${2:-}"; shift ;;
       -p|--admin-password) ADMIN_PASSWORD="${2:-}"; shift ;;
+      --mode)             MODE="${2:-auto}"; shift ;;
       --repo-dir)         REPO_DIR="${2:-}"; shift ;;
       -y|--yes)           ASSUME_YES=1 ;;
       -n|--non-interactive) NON_INTERACTIVE=1 ;;
@@ -110,13 +140,13 @@ Usage:
 
 Commands (default: install):
   install      Full install (or update) of the platform
-  start        docker compose up -d
-  stop         docker compose down
+  start        start all services
+  stop         stop all services
   restart      restart all services
   logs         tail logs for a service (default: all)
-  status       show container status + backend health
-  backup       pg_dump the database into ./backups/
-  uninstall    stop + remove containers/volumes/images (keeps .env)
+  status       show service status + backend health
+  backup       backup the database into ./backups/
+  uninstall    remove services + data (keeps .env)
 
 Options:
   -d, --domain <domain>       Public domain (e.g. cavrix.example.com)
@@ -126,6 +156,9 @@ Options:
   -z, --cf-zone-id <zone>     Cloudflare zone id (auto-detected if omitted)
   -a, --admin-email <email>   Seed admin email   [default: admin@cavrix.cloud]
   -p, --admin-password <pass> Seed admin password [default: auto-generated]
+      --mode <auto|docker|native>
+                              auto: Docker Compose if a daemon exists, else
+                              native (SQLite, no Redis)  [default: auto]
       --repo-dir <dir>        Project directory [default: script dir or /opt/cavrix]
       --regenerate-secrets    Create fresh SECRET_KEY/ENCRYPTION_KEY/DB password
   -y, --yes                   Assume yes for all prompts
@@ -149,24 +182,30 @@ ensure_project() {
     if [[ ! -f "${REPO_DIR}/${COMPOSE_FILE}" ]]; then
       die "${REPO_DIR}/${COMPOSE_FILE} not found. Use --repo-dir or clone the repo."
     fi
+  elif [[ "${REPO_DIR}" != "${SCRIPT_DIR}" ]] && [[ -d "${REPO_DIR}/.git" ]]; then
+    info "Updating existing install in ${REPO_DIR} ..."
+    git -C "${REPO_DIR}" pull --ff-only --quiet || warn "git pull failed (continuing with current code)"
   fi
   cd "${REPO_DIR}"
+  RUN_DIR="${REPO_DIR}/run"
+  LOG_DIR="${REPO_DIR}/logs"
+  mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 }
 
 # ----------------------------------------------------------- prereqs -------
 install_docker() {
   if ! have docker; then
     info "Installing Docker ..."
-    curl -fsSL https://get.docker.com | sh
+    curl -fsSL https://get.docker.com | sh || die "Docker install failed."
   fi
   if ! docker compose version >/dev/null 2>&1; then
-    die "Docker Compose v2 plugin not available. Install it and re-run."
+    die "Docker Compose v2 plugin not available. Install it or use --mode native."
   fi
   info "Docker $(docker --version | awk '{print $3}' | tr -d ',') ready"
 }
 
 install_prereqs() {
-  info "Installing prerequisites (curl, ca-certificates, git, jq, openssl, python3) ..."
+  info "Installing prerequisites (curl, ca-certificates, git, jq, openssl, python3, node build tools) ..."
   if have apt-get; then
     export DEBIAN_FRONTEND=noninteractive
     # Self-heal broken/incomplete dpkg state (common on fresh VPS images).
@@ -175,11 +214,13 @@ install_prereqs() {
     apt-get update -qq
     # --no-upgrade: only install missing packages. Never upgrade existing ones
     # (btrfs/overlay root filesystems fail dpkg's backup-hardlink with EXDEV).
-    apt-get install -y -qq --no-upgrade curl ca-certificates git jq openssl python3 >/dev/null
+    apt-get install -y -qq --no-upgrade \
+      curl ca-certificates git jq openssl python3 python3-venv xz-utils >/dev/null
   elif have dnf; then
-    dnf install -y -q curl ca-certificates git jq openssl python3
+    dnf install -y -q curl ca-certificates git jq openssl python3 python3-virtualenv xz >/dev/null 2>&1 || \
+    dnf install -y -q curl ca-certificates git jq openssl python3 xz >/dev/null
   elif have yum; then
-    yum install -y -q curl ca-certificates git jq openssl python3
+    yum install -y -q curl ca-certificates git jq openssl python3 xz >/dev/null
   fi
 }
 
@@ -210,6 +251,14 @@ load_env() {
   ADMIN_PASSWORD="${cli_admin_pw:-${SEED_ADMIN_PASSWORD:-$ADMIN_PASSWORD}}"
 }
 
+load_env_file() {
+  # Export .env into the environment for child processes (alembic, uvicorn).
+  set -a
+  # shellcheck disable=SC1090
+  source "${REPO_DIR}/.env"
+  set +a
+}
+
 write_env() {
   local need_regenerate=0
   if [[ "${REGENERATE_SECRETS}" -eq 1 ]] || [[ -z "${SECRET_KEY:-}" ]] || \
@@ -225,6 +274,14 @@ write_env() {
     ADMIN_PASSWORD="$(gen_password)"
   fi
 
+  if [[ "${MODE}" == "native" ]]; then
+    DATABASE_URL="sqlite+pysqlite:///${REPO_DIR}/data/cavrix.db"
+    REDIS_URL="redis://127.0.0.1:6379/0"
+  else
+    DATABASE_URL="postgresql+psycopg://cavrix:${POSTGRES_PASSWORD}@127.0.0.1:5432/cavrix"
+    REDIS_URL="redis://127.0.0.1:6379/0"
+  fi
+
   info "Writing ${REPO_DIR}/.env (mode 600)"
   cat > "${REPO_DIR}/.env" <<EOF
 # Generated by install.sh on $(date -u +%F\ %TZ)
@@ -236,6 +293,8 @@ CAVRIX_DOMAIN=${CAVRIX_DOMAIN}
 CORS_ORIGINS=https://${CAVRIX_DOMAIN}
 FRONTEND_URL=https://${CAVRIX_DOMAIN}
 PUBLIC_BASE_URL=https://${CAVRIX_DOMAIN}
+DATABASE_URL=${DATABASE_URL}
+REDIS_URL=${REDIS_URL}
 SECRET_KEY=${SECRET_KEY}
 ENCRYPTION_KEY=${ENCRYPTION_KEY}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -245,6 +304,7 @@ CLOUDFLARE_DNS_API_TOKEN=${CF_TOKEN}
 ACME_EMAIL=${ACME_EMAIL}
 EOF
   chmod 600 "${REPO_DIR}/.env"
+  mkdir -p "${REPO_DIR}/data"
 }
 
 # --------------------------------------------------- Caddyfile ----------
@@ -263,7 +323,18 @@ write_caddyfile() {
       echo "    }"
     fi
     echo "    encode gzip zstd"
-    echo "    reverse_proxy frontend:80"
+    if [[ "${MODE}" == "native" ]]; then
+      echo "    root * ${REPO_DIR}/frontend/dist"
+      echo "    handle /api/* {"
+      echo "        reverse_proxy 127.0.0.1:8000"
+      echo "    }"
+      echo "    handle /ws {"
+      echo "        reverse_proxy 127.0.0.1:8000"
+      echo "    }"
+      echo "    file_server"
+    else
+      echo "    reverse_proxy frontend:80"
+    fi
     echo "}"
   } > "${REPO_DIR}/.Caddyfile"
   chmod 600 "${REPO_DIR}/.Caddyfile"
@@ -363,9 +434,9 @@ setup_firewall() {
 
 # ----------------------------------------------------------- health --------
 wait_healthy() {
-  info "Waiting for backend to become healthy (up to 180s) ..."
+  info "Waiting for backend to become healthy (up to 240s) ..."
   local i
-  for i in $(seq 1 36); do
+  for i in $(seq 1 48); do
     if curl -fsSL --max-time 5 "http://127.0.0.1:8000/healthz" >/dev/null 2>&1; then
       info "Backend is healthy."
       return 0
@@ -375,22 +446,200 @@ wait_healthy() {
   warn "Backend did not become healthy in time. Check: ./install.sh logs"
 }
 
+# ============================================================ NATIVE MODE ==
+install_node() {
+  if have node && [[ "$(node -v 2>/dev/null)" == v1[89]* || "$(node -v 2>/dev/null)" == v2* ]]; then
+    info "Node $(node -v) present"
+    return 0
+  fi
+  local a
+  a="$(arch_map x64 arm64)"
+  [[ "$a" == "unsupported" ]] && die "Unsupported architecture for Node: $(uname -m)"
+  info "Installing Node ${NODE_VERSION} (${a}) to /opt ..."
+  curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${a}.tar.xz" -o /tmp/node.tar.xz
+  tar -xJf /tmp/node.tar.xz -C /opt
+  ln -sfn "/opt/node-v${NODE_VERSION}-linux-${a}" /opt/node
+  export PATH="/opt/node/bin:${PATH}"
+  info "Node $(/opt/node/bin/node -v) installed"
+}
+
+install_caddy() {
+  if have caddy; then
+    info "Caddy $(caddy version 2>/dev/null | head -c 40) present"
+    return 0
+  fi
+  local a
+  a="$(arch_map amd64 arm64)"
+  [[ "$a" == "unsupported" ]] && die "Unsupported architecture for Caddy: $(uname -m)"
+  info "Installing Caddy (with Cloudflare DNS module) ..."
+  curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=${a}&p=github.com/caddy-dns/cloudflare" \
+    -o /tmp/caddy.tar.gz
+  tar -xzf /tmp/caddy.tar.gz -C /usr/local/bin caddy
+  chmod +x /usr/local/bin/caddy
+  info "Caddy installed: /usr/local/bin/caddy"
+}
+
+native_py() {
+  if [[ ! -d "${REPO_DIR}/venv" ]]; then
+    info "Creating Python virtualenv ..."
+    python3 -m venv "${REPO_DIR}/venv"
+  fi
+  "${REPO_DIR}/venv/bin/pip" install --quiet --upgrade pip >/dev/null 2>&1 || true
+  info "Installing Python dependencies ..."
+  "${REPO_DIR}/venv/bin/pip" install --quiet -r "${REPO_DIR}/backend/requirements.txt"
+}
+
+native_migrate() {
+  info "Creating database schema (alembic upgrade head) ..."
+  cd "${REPO_DIR}/backend"
+  load_env_file
+  "${REPO_DIR}/venv/bin/alembic" upgrade head
+  cd "${REPO_DIR}"
+}
+
+native_frontend() {
+  export PATH="/opt/node/bin:${PATH}"
+  if ! have npm; then
+    die "npm not found - Node install failed."
+  fi
+  cd "${REPO_DIR}/frontend"
+  info "Installing frontend dependencies (this can take a few minutes) ..."
+  npm install --no-audit --no-fund
+  info "Building frontend ..."
+  npm run build
+  cd "${REPO_DIR}"
+}
+
+# ---- service management (pid files) ----
+_native_cmd() {
+  # _native_cmd <service> <run-command...>  (launches detached, writes pid)
+  local name="$1"; shift
+  local pidfile="${RUN_DIR}/${name}.pid"
+  nohup "$@" >"${LOG_DIR}/${name}.log" 2>&1 &
+  echo $! > "${pidfile}"
+  info "started ${name} (pid $(cat "${pidfile}"))"
+}
+
+native_stop_one() {
+  local name="$1"
+  local pidfile="${RUN_DIR}/${name}.pid"
+  if [[ -f "${pidfile}" ]] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+    kill "$(cat "${pidfile}")" 2>/dev/null || true
+    sleep 2
+    kill -9 "$(cat "${pidfile}")" 2>/dev/null || true
+    rm -f "${pidfile}"
+    info "stopped ${name}"
+  fi
+}
+
+native_start() {
+  [[ -d "${REPO_DIR}/venv" ]] || die "Not installed in native mode yet. Run: ./install.sh install"
+  load_env_file
+  export PATH="/opt/node/bin:${PATH}"
+
+  if [[ -f "${RUN_DIR}/caddy.pid" ]] && kill -0 "$(cat "${RUN_DIR}/caddy.pid")" 2>/dev/null; then
+    : # already running
+  else
+    _native_cmd caddy /usr/local/bin/caddy run --config "${REPO_DIR}/.Caddyfile" --adapter caddyfile
+  fi
+
+  if [[ -f "${RUN_DIR}/backend.pid" ]] && kill -0 "$(cat "${RUN_DIR}/backend.pid")" 2>/dev/null; then
+    : # already running
+  else
+    (
+      cd "${REPO_DIR}/backend"
+      _native_cmd backend "${REPO_DIR}/venv/bin/uvicorn" \
+        app.main:app --host 127.0.0.1 --port 8000
+    )
+  fi
+
+  if [[ -f "${RUN_DIR}/worker.pid" ]] && kill -0 "$(cat "${RUN_DIR}/worker.pid")" 2>/dev/null; then
+    : # already running
+  else
+    (
+      cd "${REPO_DIR}/backend"
+      _native_cmd worker "${REPO_DIR}/venv/bin/python" -m app.workers.worker
+    )
+  fi
+}
+
+native_stop() {
+  native_stop_one worker
+  native_stop_one backend
+  native_stop_one caddy
+}
+
+native_status() {
+  local name
+  for name in caddy backend worker; do
+    local pidfile="${RUN_DIR}/${name}.pid"
+    if [[ -f "${pidfile}" ]] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+      printf '  %-9s running (pid %s)\n' "${name}" "$(cat "${pidfile}")"
+    else
+      printf '  %-9s stopped\n' "${name}"
+    fi
+  done
+}
+
+native_logs() {
+  local svc="${1:-all}"
+  local files=()
+  case "${svc}" in
+    backend|worker|caddy) files=("${LOG_DIR}/${svc}.log") ;;
+    *) files=("${LOG_DIR}/caddy.log" "${LOG_DIR}/backend.log" "${LOG_DIR}/worker.log") ;;
+  esac
+  tail -f --lines=100 "${files[@]}"
+}
+
+native_install() {
+  info "Mode: native (no Docker daemon required - SQLite + venv + Caddy)"
+  touch "${REPO_DIR}/${NATIVE_MARKER}"
+  install_node
+  install_caddy
+  native_py
+  native_migrate
+  native_frontend
+  write_caddyfile
+  native_start
+  wait_healthy
+}
+
+# ============================================================ DOCKER MODE ==
+docker_install() {
+  info "Mode: docker (Compose stack: postgres + redis + backend + worker + frontend + caddy)"
+  rm -f "${REPO_DIR}/${NATIVE_MARKER}"
+  install_docker
+  write_caddyfile
+  info "Building images (first run takes a few minutes) ..."
+  dc up -d --build
+  wait_healthy
+}
+
 # ----------------------------------------------------------- install ------
 cmd_install() {
   ensure_project
   install_prereqs
-  install_docker
   load_env
   collect_config
   setup_cloudflare
+
+  case "${MODE}" in
+    docker)  MODE="docker" ;;
+    native)  MODE="native" ;;
+    auto)
+      if docker_ok; then MODE="docker"; else MODE="native"; fi ;;
+    *) die "Unknown mode: ${MODE} (auto|docker|native)" ;;
+  esac
+  info "Install mode: ${MODE}"
+
   write_env
-  write_caddyfile
   setup_firewall
 
-  info "Building images (first run takes a few minutes) ..."
-  dc up -d --build
-
-  wait_healthy
+  if [[ "${MODE}" == "native" ]]; then
+    native_install
+  else
+    docker_install
+  fi
 
   echo
   printf '%s%s============================================================%s\n' "$C_BOLD" "$C_GREEN" "$C_RESET"
@@ -405,13 +654,41 @@ cmd_install() {
 }
 
 # ------------------------------------------------------------ control -----
-cmd_start()    { ensure_project; dc up -d; }
-cmd_stop()     { ensure_project; dc down; }
-cmd_restart()  { ensure_project; dc down; dc up -d; }
-cmd_logs()     { ensure_project; local extra=(); [[ $# -gt 0 ]] && extra=("$@"); dc logs -f --tail=200 "${extra[@]}"; }
-cmd_status()   {
+is_native() { [[ -f "${REPO_DIR}/${NATIVE_MARKER}" ]]; }
+
+cmd_start() {
   ensure_project
-  dc ps
+  if is_native; then native_start; else dc up -d; fi
+}
+
+cmd_stop() {
+  ensure_project
+  if is_native; then native_stop; else dc down; fi
+}
+
+cmd_restart() {
+  ensure_project
+  if is_native; then native_stop; native_start; else dc restart; fi
+}
+
+cmd_logs() {
+  ensure_project
+  if is_native; then
+    native_logs "${1:-all}"
+  else
+    local extra=()
+    [[ $# -gt 0 ]] && extra=("$@")
+    dc logs -f --tail=200 "${extra[@]}"
+  fi
+}
+
+cmd_status() {
+  ensure_project
+  if is_native; then
+    native_status
+  else
+    dc ps
+  fi
   echo
   if curl -fsSL --max-time 5 "http://127.0.0.1:8000/healthz" >/dev/null 2>&1; then
     info "Backend health: OK $(curl -fsSL http://127.0.0.1:8000/healthz 2>/dev/null)"
@@ -419,20 +696,33 @@ cmd_status()   {
     warn "Backend health: not reachable (is it running?)"
   fi
 }
+
 cmd_backup() {
   ensure_project
   local dir="${REPO_DIR}/backups" stamp
   stamp="$(date +%Y%m%d_%H%M%S)"
   mkdir -p "$dir"
-  info "Backing up database to ${dir}/cavrix_${stamp}.dump"
-  dc exec -T db pg_dump -U cavrix -d cavrix -Fc > "${dir}/cavrix_${stamp}.dump"
-  info "Backup complete: ${dir}/cavrix_${stamp}.dump"
+  if is_native; then
+    info "Backing up database to ${dir}/cavrix_${stamp}.db"
+    cp "${REPO_DIR}/data/cavrix.db" "${dir}/cavrix_${stamp}.db"
+    info "Backup complete: ${dir}/cavrix_${stamp}.db"
+  else
+    info "Backing up database to ${dir}/cavrix_${stamp}.dump"
+    dc exec -T db pg_dump -U cavrix -d cavrix -Fc > "${dir}/cavrix_${stamp}.dump"
+    info "Backup complete: ${dir}/cavrix_${stamp}.dump"
+  fi
 }
+
 cmd_uninstall() {
   ensure_project
-  if confirm "This removes all containers, images and VOLUMES (database data lost). Continue?"; then
-    dc down -v
-    docker system prune -af --volumes || true
+  if confirm "This removes all services and DATA (database lost). .env/.Caddyfile kept. Continue?"; then
+    if is_native; then
+      native_stop
+      rm -rf "${REPO_DIR}/venv" "${REPO_DIR}/data" "${REPO_DIR}/frontend/node_modules" "${REPO_DIR}/frontend/dist"
+    else
+      dc down -v
+      docker system prune -af --volumes || true
+    fi
     info "Cavrix Cloud removed. .env/.Caddyfile kept in ${REPO_DIR}."
   fi
 }
@@ -441,8 +731,13 @@ cmd_uninstall() {
 main() {
   [[ "$(id -u)" -eq 0 ]] || warn "Not running as root. Docker/sudo may be needed."
   case "${CMD}" in
-    start|stop|restart|status|backup) "${CMD}" ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart ;;
     logs) cmd_logs "${POS_ARGS[@]}" ;;
+    status) cmd_status ;;
+    backup) cmd_backup ;;
+    uninstall) cmd_uninstall ;;
     install) cmd_install ;;
     *) die "Unknown command: ${CMD}" ;;
   esac

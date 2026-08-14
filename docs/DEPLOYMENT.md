@@ -2,17 +2,31 @@
 
 ## One-command installer (recommended)
 
-`./install.sh` bootstraps the whole platform on any Ubuntu/Debian VPS with a
-custom domain through Cloudflare. It installs Docker, generates all secrets,
-creates/updates Cloudflare DNS records, provisions TLS and prints admin login.
+`./install.sh` bootstraps the whole platform on any Ubuntu/Debian VPS **or**
+Docker container with a custom domain through Cloudflare. It auto-detects the
+environment:
+
+- **Docker daemon reachable** → full Compose stack (Postgres + Redis +
+  backend + worker + frontend + Caddy TLS).
+- **No Docker** (or `--mode native`) → native install: SQLite (app degrades
+  gracefully without Redis), Python venv for API/worker, static frontend
+  build, Caddy binary (with `caddy-dns/cloudflare`) for TLS.
+
+Either way it generates all secrets, creates/updates the Cloudflare DNS
+records, provisions TLS and prints admin login. The installer self-heals
+common VPS issues: broken dpkg state and, via `apt --no-upgrade`, `EXDEV`
+hardlink failures on btrfs/overlay root filesystems.
 
 ```bash
-# root on a fresh Ubuntu 22.04/24.04 VPS:
+# root on a fresh Ubuntu 22.04/24.04 VPS (or inside a container):
 bash <(curl -fsSL https://raw.githubusercontent.com/FaaizJohar/CavrixDash/main/install.sh) \
     --domain cavrix.example.com \
     --email you@example.com \
     --cf-token <YOUR_CLOUDFLARE_DNS_TOKEN>
 ```
+
+Force the mode with `--mode docker` or `--mode native`.
+Full reference: `./install.sh --help`.
 
 ### Cloudflare setup (5 minutes)
 
@@ -36,11 +50,14 @@ Traffic flow: `Caddy (:80/:443, TLS) → frontend (Nginx, SPA + /api + /ws proxy
 → backend (:8000)`. Postgres and Redis are **not exposed** to the internet.
 
 ```bash
-./install.sh status     # ps + backend /healthz
+./install.sh status     # service status + backend /healthz
 ./install.sh logs       # tail logs
-./install.sh backup     # pg_dump to ./backups/
-./install.sh uninstall  # down -v (data loss!) — keeps .env
+./install.sh backup     # DB backup (pg_dump or sqlite copy) into ./backups/
+./install.sh uninstall  # remove services + data (data loss!) — keeps .env
 ```
+
+In native mode the same commands manage the Python venv services and Caddy via
+pid files under `./run` (no Docker required); the DB is `./data/cavrix.db`.
 
 ## Stack
 
