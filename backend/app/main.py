@@ -70,6 +70,14 @@ for mod in (admin.overview, admin.users, admin.infrastructure, admin.economy, ad
 app.include_router(ws.router)
 
 
+@app.get("/health", tags=["health"])
+def health_root():
+    if check_db_ready():
+        return {"status": "healthy"}
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=503, content={"status": "unhealthy"})
+
+
 @app.get("/healthz", tags=["health"])
 def healthz():
     db_ok = check_db_ready()

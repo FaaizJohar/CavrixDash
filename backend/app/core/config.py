@@ -87,6 +87,8 @@ class Settings(BaseSettings):
     # Mock provider is a development-only fixture. MUST be explicitly enabled
     # via env in non-production environments; never enabled by default.
     mock_provider_enabled: bool = False
+    # AdGem postback HMAC-SHA256 secret (v3 POST signature verification).
+    adgem_postback_key: str = ""
     # Background offer-sync cadence (minutes). Each enabled provider is synced
     # at most once per interval.
     provider_sync_interval_minutes: int = 30

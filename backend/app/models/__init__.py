@@ -6,6 +6,7 @@ from app.models.fraud import FraudEvent, FraudRule
 from app.models.notification import Announcement, Notification
 from app.models.offer import Offer
 from app.models.provider import Provider, ProviderCredential
+from app.models.provider_event import OfferSession, ProviderEvent
 from app.models.referral import Referral
 from app.models.server import (
     PterodactylNode,
@@ -33,10 +34,12 @@ __all__ = [
     "FraudRule",
     "Notification",
     "Offer",
+    "OfferSession",
     "Permission",
     "Postback",
     "Provider",
     "ProviderCredential",
+    "ProviderEvent",
     "PterodactylNode",
     "Referral",
     "Region",

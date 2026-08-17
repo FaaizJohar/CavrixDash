@@ -65,6 +65,7 @@ def handle_postback(
     payload: dict[str, Any],
     raw_body: str,
     ip: str,
+    pre_normalized: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     provider = provider_service.get_by_code(db, provider_code)
     if not provider or not provider.enabled:
@@ -72,16 +73,19 @@ def handle_postback(
         _store_postback(db, provider_code, {}, False, ip, "unknown_provider")
         return {"status": "ignored", "message": "Provider not recognized"}
 
-    adapter = get_adapter(provider.code)
-    if not adapter:
-        _store_postback(db, provider.id, json.dumps(payload), False, ip, "no_adapter")
-        return {"status": "ignored", "message": "No adapter"}
+    if pre_normalized:
+        normalized = pre_normalized
+    else:
+        adapter = get_adapter(provider.code)
+        if not adapter:
+            _store_postback(db, provider.id, json.dumps(payload), False, ip, "no_adapter")
+            return {"status": "ignored", "message": "No adapter"}
 
-    try:
-        normalized = adapter.parse_postback(payload, provider_service.get_credentials(db, provider.id), raw_body)
-    except AppError as exc:
-        _store_postback(db, provider.id, json.dumps(payload), False, ip, f"invalid:{exc.code}")
-        return {"status": "invalid", "message": exc.message, "code": exc.code}
+        try:
+            normalized = adapter.parse_postback(payload, provider_service.get_credentials(db, provider.id), raw_body)
+        except AppError as exc:
+            _store_postback(db, provider.id, json.dumps(payload), False, ip, f"invalid:{exc.code}")
+            return {"status": "invalid", "message": exc.message, "code": exc.code}
 
     # Replay / idempotency guard — unique on (provider, conversion_id)
     existing = (

@@ -31,7 +31,7 @@ def _ensure_role(bind, name: str) -> None:
         bind.execute(
             text(
                 "INSERT INTO roles (id, name, description, is_system, created_at, updated_at) "
-                "VALUES (:id, :name, :description, 1, :now, :now)"
+                "VALUES (:id, :name, :description, true, :now, :now)"
             ),
             {
                 "id": str(uuid4()),

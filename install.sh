@@ -48,6 +48,7 @@ ASSUME_YES=0
 NON_INTERACTIVE=0
 NO_FIREWALL=0
 REGENERATE_SECRETS=0
+ADGEM_POSTBACK_KEY=""
 CMD="install"
 
 # ----------------------------------------------------------------- utils ----
@@ -114,6 +115,7 @@ parse_args() {
       -z|--cf-zone-id)    CF_ZONE_ID="${2:-}"; shift ;;
       -a|--admin-email)   ADMIN_EMAIL="${2:-}"; shift ;;
       -p|--admin-password) ADMIN_PASSWORD="${2:-}"; shift ;;
+      --adgem-postback-key) ADGEM_POSTBACK_KEY="${2:-}"; shift ;;
       --mode)             MODE="${2:-auto}"; shift ;;
       --repo-dir)         REPO_DIR="${2:-}"; shift ;;
       -y|--yes)           ASSUME_YES=1 ;;
@@ -156,6 +158,8 @@ Options:
   -z, --cf-zone-id <zone>     Cloudflare zone id (auto-detected if omitted)
   -a, --admin-email <email>   Seed admin email   [default: admin@cavrix.cloud]
   -p, --admin-password <pass> Seed admin password [default: auto-generated]
+      --adgem-postback-key <key>
+                              AdGem postback HMAC secret (v3 POST verification)
       --mode <auto|docker|native>
                               auto: Docker Compose if a daemon exists, else
                               native (SQLite, no Redis)  [default: auto]
@@ -302,6 +306,7 @@ SEED_ADMIN_EMAIL=${ADMIN_EMAIL}
 SEED_ADMIN_PASSWORD=${ADMIN_PASSWORD}
 CLOUDFLARE_DNS_API_TOKEN=${CF_TOKEN}
 ACME_EMAIL=${ACME_EMAIL}
+ADGEM_POSTBACK_KEY=${ADGEM_POSTBACK_KEY:-}
 EOF
   chmod 600 "${REPO_DIR}/.env"
   mkdir -p "${REPO_DIR}/data"
@@ -310,6 +315,7 @@ EOF
 # --------------------------------------------------- Caddyfile ----------
 write_caddyfile() {
   info "Writing ${REPO_DIR}/.Caddyfile (mode 600)"
+  local API_DOMAIN="api.${CAVRIX_DOMAIN#*.}"
   {
     if [[ -n "${ACME_EMAIL}" ]]; then
       echo "{"
@@ -336,16 +342,36 @@ write_caddyfile() {
       echo "    reverse_proxy frontend:80"
     fi
     echo "}"
+    echo ""
+    echo "${API_DOMAIN} {"
+    if [[ -n "${CF_TOKEN}" ]]; then
+      echo "    tls {"
+      echo "        dns cloudflare {env.CLOUDFLARE_DNS_API_TOKEN}"
+      echo "    }"
+    fi
+    echo "    encode gzip zstd"
+    if [[ "${MODE}" == "native" ]]; then
+      echo "    reverse_proxy 127.0.0.1:8000"
+    else
+      echo "    reverse_proxy backend:8000"
+    fi
+    echo "}"
   } > "${REPO_DIR}/.Caddyfile"
   chmod 600 "${REPO_DIR}/.Caddyfile"
 }
 
 # ------------------------------------------------------ Cloudflare ------
 cf_zone() {
-  local zone
-  zone="$(curl -fsSL --max-time 20 -H "Authorization: Bearer ${CF_TOKEN}" \
-    "https://api.cloudflare.com/client/v4/zones?name=${CAVRIX_DOMAIN}" | jq -r '.result[0].id // empty')"
-  printf '%s' "$zone"
+  # Find the registered zone for CAVRIX_DOMAIN by walking up the label chain
+  # (dash.cavrix.cloud -> cavrix.cloud), in case a subdomain is used.
+  local d="${CAVRIX_DOMAIN}" zone
+  while [[ -n "$d" ]]; do
+    zone="$(curl -fsSL --max-time 20 -H "Authorization: Bearer ${CF_TOKEN}" \
+      "https://api.cloudflare.com/client/v4/zones?name=${d}" | jq -r '.result[0].id // empty')"
+    [[ -n "$zone" ]] && { printf '%s' "$zone"; return 0; }
+    d="${d#*.}"
+  done
+  return 1
 }
 
 cf_dns_record() { # cf_dns_record <zone> <type> <name> <content> <proxied>
@@ -396,6 +422,14 @@ setup_cloudflare() {
   info "Creating DNS records for ${CAVRIX_DOMAIN} -> ${ip} (proxied)"
   cf_dns_record "$CF_ZONE_ID" "A" "@" "$ip" true || warn "Could not set A record for @ (may need manual DNS)."
   cf_dns_record "$CF_ZONE_ID" "A" "www" "$ip" true || warn "Could not set A record for www (may need manual DNS)."
+
+  local api_sub="${CAVRIX_DOMAIN%%.*}"
+  local api_name="${api_sub}"
+  if [[ "${api_name}" == "dash" ]] || [[ "${api_name}" == "www" ]]; then
+    api_name="api"
+  fi
+  info "Creating DNS record for ${api_name}.${CAVRIX_DOMAIN#*.} -> ${ip} (proxied)"
+  cf_dns_record "$CF_ZONE_ID" "A" "${api_name}" "$ip" true || warn "Could not set A record for api subdomain (may need manual DNS)."
 }
 
 # ------------------------------------------------------------- config -----
@@ -617,8 +651,8 @@ docker_install() {
 
 # ----------------------------------------------------------- install ------
 cmd_install() {
-  ensure_project
   install_prereqs
+  ensure_project
   load_env
   collect_config
   setup_cloudflare
